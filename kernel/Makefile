@@ -102,7 +102,7 @@ KERNEL_HIGHEST=$(shell echo $(KERNELS) | tr ' ' '\n' | sort -V | tail -n 1)
 
 
 # we build all tools across all platforms and kernels that we build
-TOOLS=bcc perf zfs
+TOOLS=bcc perf zfs drbd
 
 # kernel versions used for kconfig
 KERNEL_VERSIONS=$(call uniq,$(foreach l,$(KERNELS),$(word 1,$(subst -, ,$(l)))))
