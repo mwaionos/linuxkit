@@ -1,0 +1,134 @@
+ARG BUILD_IMAGE
+ARG KERNEL_VERSION
+ARG PKG_HASH
+
+FROM linuxkit/kernel:${KERNEL_VERSION}-${PKG_HASH} AS ksrc
+
+FROM ${BUILD_IMAGE} AS build
+
+ARG DRBD_VERSION=9.2.16
+ARG COCCINELLE_VERSION=1.3.0
+ARG MENHIR_VERSION=20220210
+ARG OCAMLGRAPH_VERSION=2.2.0
+
+# Kernel headers
+COPY --from=ksrc /kernel-dev.tar /
+RUN tar xf kernel-dev.tar
+
+# Also extract the kernel modules
+COPY --from=ksrc /kernel.tar /
+RUN tar xvf kernel.tar
+
+COPY --from=ksrc /linux.tar.xz /linux.tar.xz
+RUN tar xf linux.tar.xz -C /usr/src
+
+RUN cp -r /usr/src/linux-headers-*/.config /usr/src/linux
+RUN cp -r /usr/src/linux-headers-*/* /usr/src/linux
+
+RUN apk add \
+    attr-dev \
+    autoconf \
+    automake \
+    bash \
+    build-base \
+    curl \
+    elfutils-dev \
+    file \
+    git \
+    gmp-dev \
+    installkernel \
+    kmod \
+    linux-headers \
+    libtirpc-dev \
+    libtool \
+    mpc1-dev \
+    mpfr-dev \
+    openssl-dev \
+    util-linux-dev \
+    zlib-dev
+
+RUN git config --global url.https://.insteadOf git://
+
+# Build Coccinelle (spatch) from source for reliable compatibility
+RUN apk add --no-cache \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
+    ocaml \
+    ocaml-findlib \
+    ocaml-ocamlbuild \
+    ocaml-ocamldoc \
+    dune \
+    python3 \
+    py3-setuptools \
+    perl \
+    pkgconf \
+    pcre-dev \
+    bzip2 \
+    autoconf \
+    automake \
+    libtool \
+    m4
+
+# Build Menhir (via dune)
+RUN mkdir -p /tmp/menhir && \
+    curl -fsSL -o /tmp/menhir.tar.gz https://gitlab.inria.fr/fpottier/menhir/-/archive/${MENHIR_VERSION}/archive.tar.gz && \
+    tar -xzf /tmp/menhir.tar.gz -C /tmp/menhir --strip-components=1 && \
+    cd /tmp/menhir && \
+    dune build @install && \
+    dune install --prefix=/usr && \
+    menhir --version && rm -rf /tmp/menhir /tmp/menhir.tar.gz
+
+# Build OCamlGraph (via dune; install only core package, no GTK)
+RUN mkdir -p /tmp/ocamlgraph && \
+    curl -fsSL -o /tmp/ocamlgraph.tbz https://github.com/backtracking/ocamlgraph/releases/download/${OCAMLGRAPH_VERSION}/ocamlgraph-${OCAMLGRAPH_VERSION}.tbz && \
+    tar -xjf /tmp/ocamlgraph.tbz -C /tmp/ocamlgraph --strip-components=1 && \
+    cd /tmp/ocamlgraph && \
+    LIBDIR=$(ocamlfind printconf destdir) && \
+    dune build -p ocamlgraph @install && \
+    dune install -p ocamlgraph --prefix=/usr --libdir="$LIBDIR" && \
+    ocamlfind query ocamlgraph && rm -rf /tmp/ocamlgraph /tmp/ocamlgraph.tbz
+
+# Build Coccinelle (spatch)
+RUN mkdir -p /tmp/cocci-src && \
+    curl -fsSL -o /tmp/cocci.tar.gz https://github.com/coccinelle/coccinelle/archive/refs/tags/${COCCINELLE_VERSION}.tar.gz && \
+    tar -xzf /tmp/cocci.tar.gz -C /tmp/cocci-src --strip-components=1 && \
+    cd /tmp/cocci-src && \
+    if [ -x ./autogen ] || [ -f ./autogen ]; then ./autogen; fi && \
+    ./configure --disable-doc && \
+    make -j "$(getconf _NPROCESSORS_ONLN)" && \
+    make install && \
+    spatch --version && \
+    rm -rf /tmp/cocci-src /tmp/cocci.tar.gz
+
+# The mainline kernel ships its own in-tree drbd.ko (8.4.x); without this,
+# depmod has two same-named modules and silently prefers the in-tree one,
+# so `modprobe drbd` would load 8.4.x instead of the 9.2.x built below.
+RUN mkdir -p /etc/depmod.d && \
+    echo "override drbd * updates" > /etc/depmod.d/drbd-override.conf
+
+# Build and install DRBD kernel module
+RUN headers=`realpath $(cd /usr/src/linux-headers-* && pwd)` && \
+    wget https://pkg.linbit.com//downloads/drbd/9/drbd-${DRBD_VERSION}.tar.gz && \
+    tar xf drbd-${DRBD_VERSION}.tar.gz && \
+    cd drbd-${DRBD_VERSION} && \
+    sed -i "s/-s -r -f -T/-s -f -T/" drbd/Kbuild && \
+    sed -i '119s|/dev/null|/tmp/null|' drbd/Kbuild && \
+    sed -i 's/chmod --reference \$\$orig \$\$out/chmod $$(stat -c %a "\$\$orig") "\$\$out"/g' drbd/Kbuild && \
+    sed -i "s|-I|-I${headers}/include/uapi -I${headers}/include/generated/uapi -I|" drbd/drbd-kernel-compat/gen_compat_patch.sh && \
+    export CPPFLAGS="-I${headers}/include/uapi -I${headers}/include/generated/uapi" && \
+    export CFLAGS="$CPPFLAGS" && \
+    cd /drbd-${DRBD_VERSION} && \
+    make KDIR=${headers} EXTRA_CFLAGS="$CPPFLAGS" && \
+    make KDIR=`realpath $(cd /usr/src/linux-headers-* && pwd)` install
+
+# `make install`'s own depmod hook silently no-ops without a System.map
+# (we don't have one here), so it never regenerates modules.dep against
+# the override above. Run it explicitly instead.
+RUN cd /lib/modules && depmod -ae *
+
+FROM scratch
+ENTRYPOINT []
+CMD []
+WORKDIR /
+COPY --from=build /lib/modules/ /lib/modules/

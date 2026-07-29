@@ -1,0 +1,3 @@
+image: kernel-drbd
+network: true
+dockerfile: common/Dockerfile.drbd
